@@ -41,7 +41,7 @@ Six runtime components plus two stores. Each has one job and is the single write
 | **Long-running worker** | render-services `common/quartermaster/extract` | ECS Fargate, GDAL image (+ LibreDWG, OPEN-08) | Job `quartermaster_extract_upload`: verify → segregate → extract → layer summary. Only reader of raw uploads and only writer of extracted GeoJSON (ADR-01) | Stage rows with `runtime = lrw` | Postgres; S3 |
 | **Sweeper** | render-services | Scheduled Lambda | Re-publishes stale or stuck stage rows | — | Postgres; SNS |
 | **RDL engine** | rdl-engine (own repo, ADR-09) | Lambda container image, Node 22, 15 min, stateless | No AI: `profile`, `validate` (incl. task-flow conformance, QM-07), `compile`, `inspect`, `parse` (RDL → AST), `serialize` (AST → RDL) (QM-04). AI: `draft-layer`, `draft-join`, `fix`, `edit`, `diff-explain`, `project-knowledge`, `apply-change`. Also a CLI with the same actions | One action per invocation; design passed by reference `{sha256, bytes, presigned URL, excluded_layers}` (ADR-04) | S3 (presigned GET); Databricks |
-| **Form viewer** | new, served by render-services or the MFE | Static bundle | Renders a form template against a task for the crew app, evaluates conditions and button actions (QM-11) | Link opened by the crew app with a signed token | API (template, context); Render submission API; Render task API |
+| **Form viewer** | new, served by render-services or the MFE (OPEN-16) | Static bundle | Renders a form template against a task for the crew app, evaluates conditions and button actions (QM-11) | Link opened by the crew app with a signed token | API (template, context); Render submission API; Render task API |
 | **Postgres** | RDS, schema `respawned`, prefix `quartermaster_` | — | All workflow state: 29 tables + forms tables (QM-11) | SQL | — |
 | **S3** | one bucket, `<prefix>/<tenant_id>/<area>/<key>` | — | Uploads, content-addressed GeoJSON and profiles, knowledge versions, RDL programs and ASTs, task files, hub, tenant library | Presigned POST/GET | — |
 
@@ -63,7 +63,7 @@ Every piece of design data has exactly one writer. Content-addressed objects are
 | RDL program text + AST | `run.rdl_text`; S3 `rdl/runs/<run_id>/program.rdl`, `program.ast.json` | Stage worker via engine `draft-join` / `serialize` | Engine `validate`, `compile`, `edit`, `project-knowledge`; questions apply; review |
 | Question plan | `run.question_plan` | Stage worker (backend LLM) | Design analysis page |
 | Answers (submitted only, QM-06) | `project_setting` key `discover` | API | Apply-answers step |
-| Knowledge (system, domain, project, questions, forms, task\_types, telecom, blueprint, customer) | S3 `knowledge/<kind>-knowledge.<token>.md`, `knowledge/projects/<id>/project-knowledge.<token>.md`; index `knowledge_version` | Knowledge service (S3 first, then index row); engine `project-knowledge` for project kind | Draft, join, questions, chat; `run.knowledge_version_ids` pins them (RA-08) |
+| Knowledge (system, domain, project, questions, forms, task\_types, telecom, blueprint, customer) | S3 `knowledge/<kind>-knowledge.<token>.md`, `knowledge/projects/<id>/project-knowledge.<token>.md`; index `knowledge_version` | Knowledge service (S3 first, then index row); engine `project-knowledge` for project kind | Draft, join, questions, chat, each through its own slice (QM-16); `run.knowledge_version_ids` pins them (RA-08) |
 | Overlay (tag overrides, exceptions) | `overlay_version`, `tag_overlay`, `feature_exception` (append-only) | API (review edits, chat proposals) | DesignLoader → engine `compile` |
 | Compiled plan | `run_feature`, `staged_task` (with `placement_id` = activity, QM-07), `staged_dependency` | Stage worker `compile` persist | Review, mapping, blueprint |
 | Unit / job code mapping | `feature_mapping`, `mapping_review`, `learned_mapping` (tenant-wide) | Stage worker `unit_code_mapping`; API (manual pick) | Review, BoQ, blueprint |
@@ -75,6 +75,15 @@ Every piece of design data has exactly one writer. Content-addressed objects are
 | Blueprint push | `blueprint_push`; Render `respawned.tasks` with `integration_metadata.quartermaster.task_key` | Stage worker `blueprint` | Render; retry skips written tasks |
 | Tenant library | S3 `library/tenant-library/<tenant>.json` | Blueprint create | New projects |
 
+**Knowledge hierarchy and slices.** Render domain knowledge (global) → tenant (customer) knowledge → Project Knowledge, generated per project in sync with its RDL. Promoting Project Knowledge upward is OPEN-12. Each LLM caller reads one slice, sent as a byte-identical cached prefix pinned per run (QM-16, QM-17); sizes are from the test-2 spend report.
+
+| Consumer | Knowledge slice | Size (tokens) |
+| --- | --- | --- |
+| Per-layer draft | design\_extraction + element\_task\_matching | \~6k |
+| Join, fix, edit | per-layer slice + RDL instructions + task types | \~8–10k |
+| Question planner | questions (question\_and\_answer\_tree) | \~24k |
+| Form matching | forms (form\_mapping) | \~35.6k |
+
 ## 4. Pipeline stages
 
 One stage row per unit of work, enqueued in the same transaction as the state change, claimed by conditional UPDATE, exactly once. Order on an initial run; `*` marks an LLM call. No invocation holds more than one LLM call plus one deterministic step (QM-14).
@@ -85,11 +94,11 @@ One stage row per unit of work, enqueued in the same transaction as the state ch
 | 2 | `extract · segregate` | Fargate | ZIP verified | ZIP | one source\_file per shapefile set | 3 (per set) |
 | 3 | `extract · extract` | Fargate | Source registered | source file | `geojson/<hash>.geojson`, layer summary, counters; last source marks upload ready | — (user chooses layers) |
 | 4 | `rdl_generation · start` | Lambda | Layers confirmed | GeoJSON refs, excluded layers | run row, design hash, design profile (engine `profile`, reused by hash) | 5 (one per kept layer) |
-| 5 | `rdl_generation · draft_layer` \* | Lambda | start done | profile slice for one layer + knowledge | per-layer JSON: asset type, attribute keys, field mappings, confidence (`run_fragment`); `layers_done` += 1 | 6 when `layers_done = layers_total` (`join_enqueued` guard) |
-| 6 | `rdl_generation · join` \* | Lambda | All layers done AND task flow confirmed | all layer JSONs + knowledge + task flow (activities) | RDL text + AST (engine `draft-join`, `parse`), assumptions | 7 |
+| 5 | `rdl_generation · draft_layer` \* | Lambda | start done | profile slice for one layer + per-layer knowledge slice as a cached prefix (QM-16, QM-17); the first layer is sent alone to warm the cache | per-layer JSON: asset type, attribute keys, field mappings, confidence (`run_fragment`); `layers_done` += 1 | 6 when `layers_done = layers_total` (`join_enqueued` guard) |
+| 6 | `rdl_generation · join` \* | Lambda | All layers done AND task flow confirmed | all layer JSONs + join knowledge slice (QM-16) + task flow (activities) | RDL text + AST (engine `draft-join`, `parse`), assumptions | 7 |
 | 7 | `rdl_generation · questions` \* | Lambda | join done | AST + questions knowledge | question plan on run; run status `waiting_for_answers` | — (user answers) |
 | 8 | `rdl_generation · apply_answers` | Lambda | questions continue | AST + submitted answers + defaults from pinned questions version | edited AST, RDL text (engine `serialize`) | 9 |
-| 9 | `rdl_generation · validate_fix` (\*) | Lambda | apply done | RDL, task flow, vocabulary | validation result; up to 2–3 fix attempts per invocation (engine `fix`), chained | 9 again or 10 |
+| 9 | `rdl_generation · validate_fix` (\*) | Lambda | apply done | RDL, task flow, vocabulary | validation result; one fix attempt per invocation (engine `fix`), chained | 9 again or 10 |
 | 10 | `rdl_generation · compile` | Lambda | validated | RDL + GeoJSON ref + overlay + task flow | tasks, dependencies, run features, `placement_id` per task, no-task notices (engine `compile`); persisted | 11 |
 | 11 | `rdl_generation · project_knowledge` \* | Lambda | compiled | AST | Project Knowledge v1 (engine `project-knowledge`) | 12 |
 | 12 | `unit_code_mapping` \* | Lambda | knowledge done | tasks grouped by (task type, descriptor); learned mappings; job code list | feature\_mapping, mapping\_review, planned quantities; run `ready` | — (user reviews) |
@@ -125,7 +134,7 @@ Lifelines for the sequence diagram: **Browser**, **API** (Lambda), **Stage worke
 |  | 4 | Browser → API | `PUT …/discover answers` | submitted answers in `project_setting.discover` |
 |  | 5 | Browser → API | `POST …/questions/continue` | `apply_answers` enqueued |
 | 7 Preparing | 1 | Worker → Engine | `serialize` (AST + answers → RDL) | RDL stored |
-|  | 2 | Worker → Engine (→ Databricks on fail) | `validate` incl. task-flow conformance; `fix` ≤ 3 per invocation, chained | validation result, fix attempts |
+|  | 2 | Worker → Engine (→ Databricks on fail) | `validate` incl. task-flow conformance; `fix` one attempt per invocation, chained up to the per-run cap | validation result, fix attempts |
 |  | 3 | Worker → Engine | `compile` (RDL + GeoJSON ref + overlay + activities) | tasks, dependencies, features, `placement_id`, no-task notices; persisted |
 |  | 4 | Worker → Engine → Databricks | `project-knowledge` | Project Knowledge v1 (S3 + index row) |
 |  | 5 | Worker → Databricks | unit code selection per (task type, descriptor); learned mappings first | feature\_mapping, mapping\_review; run `ready` |
@@ -153,6 +162,7 @@ Every change creates a new run; the project's `current_run_id` moves. Runs are n
 | Picks a job code on a needs-review feature | (same run) | feature\_mapping updated; learned\_mapping written | No | No | — |
 | Asks the chat for a change | `edit` | chat writes Project Knowledge → engine `edit` (targeted AST edit) → `diff-explain` → proposed run | Yes | Yes, merges the diff | project knowledge version |
 | NDM changes Render Domain Knowledge | `edit` | "changes pending" on affected projects → Apply → same path as chat | Yes | Yes | domain knowledge version |
+| NDM changes tenant knowledge or promotes Project Knowledge upward (OPEN-12) | edit | new knowledge version → "changes pending" on affected projects → Apply → same path as chat | Yes | Yes | customer or domain knowledge version |
 | Edits the task flow after a run exists | `edit` (QM-10) | engine `validate` conformance + `edit` → diff → merge | Yes | Yes | task flow hash |
 | Answers a question again | `edit` | apply\_answers over current AST → validate → compile | Only if fix needed | Yes | answers |
 | Uploads a new design version | `revision` | extract new files; `draft_layer` only for uncovered layers; join merges with base run's AST; full chain after | Yes | Review as normal | design hash |
@@ -168,11 +178,11 @@ All inside the Render AWS account, deployed by the render-services pipeline exce
 | --- | --- | --- | --- | --- | --- | --- |
 | QuarterMaster MFE | S3 + CloudFront (existing scale-respawned bundle) | SystemJS bundle | — | CDN | API Gateway; S3 upload bucket (presigned); Mapbox | Current |
 | API Gateway + Okta authorizer | API Gateway | — | 29 s per request | Managed | API Lambda | Current |
-| API | Lambda, Python 3.11 (Mangum) | render-services zip | 29 s effective; no inline engine or LLM calls | Per request | RDS, S3, SNS, RDL engine only for sub-second `inspect` | Current, inline recompile removed (ADR-07) |
+| API | Lambda, Python 3.11 (Mangum) | render-services zip | 29 s effective; no inline engine or LLM calls | Per request | RDS, S3, SNS | Current, inline recompile removed (ADR-07) |
 | Stage worker | Lambda, Python 3.11 | render-services zip | 15 min; one LLM call + one deterministic step per invocation (QM-14) | Per SNS message; concurrency cap | RDS, S3, RDL engine (Invoke), Databricks, Render REST | Current |
 | Sweeper | Lambda, scheduled (EventBridge) | render-services zip | — | — | RDS, SNS | Current |
 | Long-running worker | ECS Fargate | GDAL image + ezdxf + KML parser + LibreDWG (OPEN-08) | No time limit | Task per job | RDS, S3 | Current |
-| RDL engine | Lambda container image, Node 22 | rdl-engine image from ECR | 15 min; 10 GB memory/ephemeral; design cache per warm container | Per invocation; reserved concurrency to protect short actions | S3 (presigned GET), Databricks | Proposed (QM-13, RA-02) |
+| RDL engine | Lambda container image, Node 22 | rdl-engine image from ECR | 15 min; 10 GB memory/ephemeral; design cache per warm container; invoke response ≤ 6 MB, so larger results go to S3 by reference (OPEN-15) | Per invocation; reserved concurrency to protect short actions | S3 (presigned GET), Databricks | Proposed (QM-13, RA-02) |
 | Form viewer | Static bundle (same CDN as MFE) | new | — | CDN | API; Render submission and task APIs | Proposed (QM-11) |
 | Postgres | RDS PostgreSQL ≥ 15 | schema `respawned`, `quartermaster_*` | — | — | — | Current |
 | S3 | one bucket, `<prefix>/<tenant_id>/<area>/` | eight areas (+ `forms`) | 500 MB per upload; `content-length-range` on presigned POST | — | — | Current |
@@ -208,10 +218,10 @@ All inside the Render AWS account, deployed by the render-services pipeline exce
 
 - **Exactly-once stages.** One `stage` row per logical message, unique `idempotency_key` `{project}:{stage}:{step}:{entity}[:{part}]`; enqueue `INSERT … ON CONFLICT DO NOTHING` in the same transaction as the state change; claim by conditional `UPDATE … RETURNING`; complete row, results and next rows in one transaction; publish after commit. Sweeper re-drives stale rows by `updated_at` heartbeat.
 - **Completion counting.** Upload: `files_total / files_registered / sources_registered / sources_finished` bumped by single `UPDATE … RETURNING`; the update that makes finished = registered enqueues `rdl_generation/start`. Run: `layers_total / layers_done` the same way; `join_enqueued` guards the single join. Join also waits for `layers_confirmed_at` on the task flow.
-- **Determinism.** Every LLM call at temperature 0 against a pinned model, cached by hash of its full input. Parse, serialize, validate, compile, quantities and asset IDs are code. Same replay key (project ID, GeoJSON hashes, overlay version, exceptions version, knowledge version IDs, vocabulary hash, task flow hash, answers, pinned asset IDs, model version) → same tasks in the same order.
+- **Determinism.** Every LLM call at temperature 0 against a pinned model, cached by hash of its full input. Parse, serialize, validate, compile, quantities and asset IDs are code. Same replay key (project ID, GeoJSON hashes, overlay version, exceptions version, knowledge version IDs, vocabulary hash, task flow hash, answers, pinned asset IDs, model version; engine version and prompt / slice template version to be added, OPEN-14) → same tasks in the same order.
 - **Immutability.** GeoJSON and profiles are content-addressed and never deleted. Runs are history; a new run per change. Knowledge versions are written once under a token key. Finalized runs and blueprinted projects are read-only (`require_editable()`).
 - **Tenant isolation.** `tenant_id` on every row; composite `(col, tenant_id)` FKs to parents with `UNIQUE (id, tenant_id)`; S3 keys under `<prefix>/<tenant_id>/`; `BlobStore` bound per tenant; DesignLoader cache keyed by the full tenant-prefixed key; stages run inside the tenant's LLM scope; retention and delete take a per-tenant advisory lock.
-- **Failure handling.** A failed file or source is marked failed with its error and counts as finished; the rest of the upload carries on. No file passes → upload failed, no run. Validation failures go through fix, capped per invocation and chained; unresolved errors are shown with the tasks. Mapping below the confidence threshold → `needs_review`. Engine failure at start is retried; the last retry fails the run and the UI offers retry.
+- **Failure handling.** A failed file or source is marked failed with its error and counts as finished; the rest of the upload carries on. No file passes → upload failed, no run. Validation failures go through fix, one attempt per invocation, chained up to a per-run cap; unresolved errors are shown with the tasks. Mapping below the confidence threshold → `needs_review`. Engine failure at start is retried; the last retry fails the run and the UI offers retry.
 - **Time budget.** API 29 s: no inline engine or LLM calls. Stage worker and engine 15 min: one LLM call plus one deterministic step per invocation. Extraction unbounded on Fargate.
 - **Human gates.** Layer choice; task flow confirmation; question answers; review of asset mapping and open questions; proposal merge after a diff; manual job code picks; blueprint create.
 - **Observability.** `llm_call` per call with cost and tokens, rolled up on the run; `pipeline_event` per finding; per-stage count, duration and failure metrics; analytics in Databricks fed from Postgres.
